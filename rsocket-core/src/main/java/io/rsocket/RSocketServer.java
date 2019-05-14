@@ -18,24 +18,28 @@ package io.rsocket;
 
 import static io.rsocket.keepalive.KeepAliveSupport.KeepAlive;
 import static io.rsocket.keepalive.KeepAliveSupport.ServerKeepAliveSupport;
+import static io.rsocket.util.BackpressureUtils.shareRequest;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.util.ReferenceCountUtil;
-import io.netty.util.collection.IntObjectHashMap;
 import io.rsocket.exceptions.ApplicationErrorException;
 import io.rsocket.exceptions.ConnectionErrorException;
-import io.rsocket.frame.*;
+import io.rsocket.frame.CancelFrameFlyweight;
+import io.rsocket.frame.ErrorFrameFlyweight;
+import io.rsocket.frame.FrameHeaderFlyweight;
+import io.rsocket.frame.FrameType;
+import io.rsocket.frame.PayloadFrameFlyweight;
+import io.rsocket.frame.RequestChannelFrameFlyweight;
+import io.rsocket.frame.RequestNFrameFlyweight;
+import io.rsocket.frame.RequestStreamFrameFlyweight;
 import io.rsocket.frame.decoder.PayloadDecoder;
 import io.rsocket.internal.LimitableRequestPublisher;
+import io.rsocket.internal.SynchronizedIntObjectHashMap;
 import io.rsocket.internal.UnboundedProcessor;
 import io.rsocket.keepalive.KeepAliveFramesAcceptor;
 import io.rsocket.keepalive.KeepAliveHandler;
 import io.rsocket.keepalive.KeepAliveSupport;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Map;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Consumer;
 import org.reactivestreams.Processor;
 import org.reactivestreams.Publisher;
@@ -43,7 +47,11 @@ import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 import reactor.core.Disposable;
 import reactor.core.Exceptions;
-import reactor.core.publisher.*;
+import reactor.core.publisher.BaseSubscriber;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.publisher.SignalType;
+import reactor.core.publisher.UnicastProcessor;
 
 /** Server side RSocket. Receives {@link ByteBuf}s from a {@link RSocketClient} */
 class RSocketServer implements ResponderRSocket {
@@ -54,9 +62,10 @@ class RSocketServer implements ResponderRSocket {
   private final PayloadDecoder payloadDecoder;
   private final Consumer<Throwable> errorConsumer;
 
-  private final Map<Integer, LimitableRequestPublisher> sendingLimitableSubscriptions;
-  private final Map<Integer, Subscription> sendingSubscriptions;
-  private final Map<Integer, Processor<Payload, Payload>> channelProcessors;
+  private final SynchronizedIntObjectHashMap<LimitableRequestPublisher>
+      sendingLimitableSubscriptions;
+  private final SynchronizedIntObjectHashMap<Subscription> sendingSubscriptions;
+  private final SynchronizedIntObjectHashMap<Processor<Payload, Payload>> channelProcessors;
 
   private final UnboundedProcessor<ByteBuf> sendProcessor;
   private final ByteBufAllocator allocator;
@@ -91,35 +100,16 @@ class RSocketServer implements ResponderRSocket {
 
     this.payloadDecoder = payloadDecoder;
     this.errorConsumer = errorConsumer;
-    this.sendingLimitableSubscriptions = Collections.synchronizedMap(new IntObjectHashMap<>());
-    this.sendingSubscriptions = Collections.synchronizedMap(new IntObjectHashMap<>());
-    this.channelProcessors = Collections.synchronizedMap(new IntObjectHashMap<>());
+    this.sendingLimitableSubscriptions = new SynchronizedIntObjectHashMap<>();
+    this.sendingSubscriptions = new SynchronizedIntObjectHashMap<>();
+    this.channelProcessors = new SynchronizedIntObjectHashMap<>();
 
     // DO NOT Change the order here. The Send processor must be subscribed to before receiving
     // connections
     this.sendProcessor = new UnboundedProcessor<>();
 
     sendProcessor
-        .doOnRequest(
-            r -> {
-              ThreadLocalRandom threadLocalRandom = ThreadLocalRandom.current();
-              ArrayList<LimitableRequestPublisher> activeSubscriptions =
-                  new ArrayList<>(sendingLimitableSubscriptions.values());
-              int size = activeSubscriptions.size();
-              int randomStartIndex = threadLocalRandom.nextInt(0, size);
-              long requestPerItem = r / size;
-
-              requestPerItem = requestPerItem == 0 ? 1L : requestPerItem;
-
-              for (int i = 0; i < size && r >= 0; i++, r -= requestPerItem) {
-                LimitableRequestPublisher lrp = activeSubscriptions.get(randomStartIndex);
-                lrp.increaseInternalLimit(requestPerItem);
-                randomStartIndex++;
-                if (randomStartIndex == size) {
-                  randomStartIndex = 0;
-                }
-              }
-            })
+        .doOnRequest(r -> shareRequest(r, sendingLimitableSubscriptions))
         .transform(connection::send)
         .doFinally(this::handleSendProcessorCancel)
         .subscribe(null, this::handleSendProcessorError);
@@ -511,7 +501,13 @@ class RSocketServer implements ResponderRSocket {
 
               @Override
               protected void hookFinally(SignalType type) {
-                sendingLimitableSubscriptions.remove(streamId);
+                LimitableRequestPublisher subscription =
+                    sendingLimitableSubscriptions.remove(streamId);
+
+                long requested = subscription.getInternalRequested();
+                if (requested > 0) {
+                  shareRequest(requested, sendingLimitableSubscriptions);
+                }
               }
             });
   }
@@ -551,10 +547,17 @@ class RSocketServer implements ResponderRSocket {
     Subscription subscription = sendingSubscriptions.remove(streamId);
 
     if (subscription == null) {
-      subscription = sendingLimitableSubscriptions.get(streamId);
-    }
+      LimitableRequestPublisher limitableSubscription =
+          sendingLimitableSubscriptions.remove(streamId);
 
-    if (subscription != null) {
+      if (limitableSubscription != null) {
+        limitableSubscription.cancel();
+        long requested = limitableSubscription.getInternalRequested();
+        if (requested > 0) {
+          shareRequest(requested, sendingLimitableSubscriptions);
+        }
+      }
+    } else {
       subscription.cancel();
     }
   }

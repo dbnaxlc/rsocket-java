@@ -18,26 +18,23 @@ package io.rsocket;
 
 import static io.rsocket.keepalive.KeepAliveSupport.ClientKeepAliveSupport;
 import static io.rsocket.keepalive.KeepAliveSupport.KeepAlive;
+import static io.rsocket.util.BackpressureUtils.shareRequest;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.util.ReferenceCountUtil;
-import io.netty.util.collection.IntObjectHashMap;
 import io.rsocket.exceptions.ConnectionErrorException;
 import io.rsocket.exceptions.Exceptions;
 import io.rsocket.frame.*;
 import io.rsocket.frame.decoder.PayloadDecoder;
 import io.rsocket.internal.LimitableRequestPublisher;
+import io.rsocket.internal.SynchronizedIntObjectHashMap;
 import io.rsocket.internal.UnboundedProcessor;
 import io.rsocket.internal.UnicastMonoProcessor;
 import io.rsocket.keepalive.KeepAliveFramesAcceptor;
 import io.rsocket.keepalive.KeepAliveHandler;
 import io.rsocket.keepalive.KeepAliveSupport;
 import java.nio.channels.ClosedChannelException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Map;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.function.Consumer;
 import java.util.function.LongConsumer;
@@ -54,8 +51,8 @@ class RSocketClient implements RSocket {
   private final PayloadDecoder payloadDecoder;
   private final Consumer<Throwable> errorConsumer;
   private final StreamIdSupplier streamIdSupplier;
-  private final Map<Integer, LimitableRequestPublisher> senders;
-  private final Map<Integer, Processor<Payload, Payload>> receivers;
+  private final SynchronizedIntObjectHashMap<Processor<Payload, Payload>> receivers;
+  private final SynchronizedIntObjectHashMap<LimitableRequestPublisher> senders;
   private final UnboundedProcessor<ByteBuf> sendProcessor;
   private final Lifecycle lifecycle = new Lifecycle();
   private final ByteBufAllocator allocator;
@@ -76,8 +73,8 @@ class RSocketClient implements RSocket {
     this.payloadDecoder = payloadDecoder;
     this.errorConsumer = errorConsumer;
     this.streamIdSupplier = streamIdSupplier;
-    this.senders = Collections.synchronizedMap(new IntObjectHashMap<>());
-    this.receivers = Collections.synchronizedMap(new IntObjectHashMap<>());
+    this.senders = new SynchronizedIntObjectHashMap<>();
+    this.receivers = new SynchronizedIntObjectHashMap<>();
 
     // DO NOT Change the order here. The Send processor must be subscribed to before receiving
     this.sendProcessor = new UnboundedProcessor<>();
@@ -85,26 +82,7 @@ class RSocketClient implements RSocket {
     connection.onClose().doFinally(signalType -> terminate()).subscribe(null, errorConsumer);
 
     sendProcessor
-        .doOnRequest(
-            r -> {
-              ThreadLocalRandom threadLocalRandom = ThreadLocalRandom.current();
-              ArrayList<LimitableRequestPublisher> activeSubscriptions =
-                  new ArrayList<>(senders.values());
-              int size = activeSubscriptions.size();
-              int randomStartIndex = threadLocalRandom.nextInt(0, size);
-              long requestPerItem = r / size;
-
-              requestPerItem = requestPerItem == 0 ? 1L : requestPerItem;
-
-              for (int i = 0; i < size && r >= 0; i++, r -= requestPerItem) {
-                LimitableRequestPublisher lrp = activeSubscriptions.get(randomStartIndex);
-                lrp.increaseInternalLimit(requestPerItem);
-                randomStartIndex++;
-                if (randomStartIndex == size) {
-                  randomStartIndex = 0;
-                }
-              }
-            })
+        .doOnRequest(r -> shareRequest(r, senders))
         .transform(connection::send)
         .doFinally(this::handleSendProcessorCancel)
         .subscribe(null, this::handleSendProcessorError);
@@ -429,6 +407,10 @@ class RSocketClient implements RSocket {
                     LimitableRequestPublisher sender = senders.remove(streamId);
                     if (sender != null) {
                       sender.cancel();
+                      long requested = sender.getInternalRequested();
+                      if (requested > 0) {
+                        shareRequest(requested, senders);
+                      }
                     }
                   });
         });
@@ -534,6 +516,10 @@ class RSocketClient implements RSocket {
             LimitableRequestPublisher sender = senders.remove(streamId);
             if (sender != null) {
               sender.cancel();
+              long requested = sender.getInternalRequested();
+              if (requested > 0) {
+                shareRequest(requested, senders);
+              }
             }
             break;
           }
