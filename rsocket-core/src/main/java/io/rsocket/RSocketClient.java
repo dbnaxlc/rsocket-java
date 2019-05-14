@@ -34,8 +34,10 @@ import io.rsocket.keepalive.KeepAliveFramesAcceptor;
 import io.rsocket.keepalive.KeepAliveHandler;
 import io.rsocket.keepalive.KeepAliveSupport;
 import java.nio.channels.ClosedChannelException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.function.Consumer;
 import java.util.function.LongConsumer;
@@ -85,8 +87,22 @@ class RSocketClient implements RSocket {
     sendProcessor
         .doOnRequest(
             r -> {
-              for (LimitableRequestPublisher lrp : senders.values()) {
-                lrp.increaseInternalLimit(r);
+              ThreadLocalRandom threadLocalRandom = ThreadLocalRandom.current();
+              ArrayList<LimitableRequestPublisher> activeSubscriptions =
+                  new ArrayList<>(senders.values());
+              int size = activeSubscriptions.size();
+              int randomStartIndex = threadLocalRandom.nextInt(0, size);
+              long requestPerItem = r / size;
+
+              requestPerItem = requestPerItem == 0 ? 1L : requestPerItem;
+
+              for (int i = 0; i < size && r >= 0; i++, r -= requestPerItem) {
+                LimitableRequestPublisher lrp = activeSubscriptions.get(randomStartIndex);
+                lrp.increaseInternalLimit(requestPerItem);
+                randomStartIndex++;
+                if (randomStartIndex == size) {
+                  randomStartIndex = 0;
+                }
               }
             })
         .transform(connection::send)

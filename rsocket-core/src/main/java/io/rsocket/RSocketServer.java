@@ -29,11 +29,13 @@ import io.rsocket.frame.*;
 import io.rsocket.frame.decoder.PayloadDecoder;
 import io.rsocket.internal.LimitableRequestPublisher;
 import io.rsocket.internal.UnboundedProcessor;
+import java.util.ArrayList;
 import io.rsocket.keepalive.KeepAliveFramesAcceptor;
 import io.rsocket.keepalive.KeepAliveHandler;
 import io.rsocket.keepalive.KeepAliveSupport;
 import java.util.Collections;
 import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Consumer;
 import org.reactivestreams.Processor;
 import org.reactivestreams.Publisher;
@@ -100,8 +102,22 @@ class RSocketServer implements ResponderRSocket {
     sendProcessor
         .doOnRequest(
             r -> {
-              for (LimitableRequestPublisher lrp : sendingLimitableSubscriptions.values()) {
-                lrp.increaseInternalLimit(r);
+              ThreadLocalRandom threadLocalRandom = ThreadLocalRandom.current();
+              ArrayList<LimitableRequestPublisher> activeSubscriptions =
+                  new ArrayList<>(sendingLimitableSubscriptions.values());
+              int size = activeSubscriptions.size();
+              int randomStartIndex = threadLocalRandom.nextInt(0, size);
+              long requestPerItem = r / size;
+
+              requestPerItem = requestPerItem == 0 ? 1L : requestPerItem;
+
+              for (int i = 0; i < size && r >= 0; i++, r -= requestPerItem) {
+                LimitableRequestPublisher lrp = activeSubscriptions.get(randomStartIndex);
+                lrp.increaseInternalLimit(requestPerItem);
+                randomStartIndex++;
+                if (randomStartIndex == size) {
+                  randomStartIndex = 0;
+                }
               }
             })
         .transform(connection::send)
