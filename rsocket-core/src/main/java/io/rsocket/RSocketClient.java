@@ -407,10 +407,10 @@ class RSocketClient implements RSocket {
                     LimitableRequestPublisher sender = senders.remove(streamId);
                     if (sender != null) {
                       sender.cancel();
-                      long requested = sender.getInternalRequested();
-                      if (requested > 0) {
-                        shareRequest(requested, senders);
-                      }
+                      //                      long requested = sender.getInternalRequested();
+                      //                      if (requested > 0) {
+                      //                        shareRequest(requested, senders);
+                      //                      }
                     }
                   });
         });
@@ -516,10 +516,10 @@ class RSocketClient implements RSocket {
             LimitableRequestPublisher sender = senders.remove(streamId);
             if (sender != null) {
               sender.cancel();
-              long requested = sender.getInternalRequested();
-              if (requested > 0) {
-                shareRequest(requested, senders);
-              }
+              //              long requested = sender.getInternalRequested();
+              //              if (requested > 0) {
+              //                shareRequest(requested, senders);
+              //              }
             }
             break;
           }

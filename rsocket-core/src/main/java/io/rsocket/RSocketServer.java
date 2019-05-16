@@ -504,10 +504,10 @@ class RSocketServer implements ResponderRSocket {
                 LimitableRequestPublisher subscription =
                     sendingLimitableSubscriptions.remove(streamId);
 
-                long requested = subscription.getInternalRequested();
-                if (requested > 0) {
-                  shareRequest(requested, sendingLimitableSubscriptions);
-                }
+                //                long requested = subscription.getInternalRequested();
+                //                if (requested > 0) {
+                //                  shareRequest(requested, sendingLimitableSubscriptions);
+                //                }
               }
             });
   }
@@ -552,10 +552,10 @@ class RSocketServer implements ResponderRSocket {
 
       if (limitableSubscription != null) {
         limitableSubscription.cancel();
-        long requested = limitableSubscription.getInternalRequested();
-        if (requested > 0) {
-          shareRequest(requested, sendingLimitableSubscriptions);
-        }
+        //        long requested = limitableSubscription.getInternalRequested();
+        //        if (requested > 0) {
+        //          shareRequest(requested, sendingLimitableSubscriptions);
+        //        }
       }
     } else {
       subscription.cancel();
